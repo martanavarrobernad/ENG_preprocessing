@@ -1,0 +1,114 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec 15 14:53:04 2025
+
+@author: navar
+"""
+
+import numpy as np
+import mne
+from pathlib import Path
+
+SET_PATH = Path(r"C:\Users\navar\Desktop\ds004388-1.0.0\sub-001\eeg\sub-001_task-median_run-03_eeg.set")
+
+ENG_CHS = ["EP", "Biceps"]  # tus canales ENG
+
+def interpolate_artifact_window(raw, events, picks, tmin=-0.0015, tmax=0.004):
+    """
+    Interpolación lineal en el tiempo entre los bordes del intervalo [tmin, tmax]
+    alrededor de cada evento. tmin/tmax en segundos relativos al onset.
+    """
+    raw.load_data()
+    sfreq = raw.info["sfreq"]
+    n_times = raw.n_times
+
+    data = raw.get_data(picks=picks)  # (n_ch, n_times)
+
+    smin_rel = int(round(tmin * sfreq))
+    smax_rel = int(round(tmax * sfreq))
+
+    for samp, _, _ in events:
+        s0 = int(samp)
+        a = s0 + smin_rel
+        b = s0 + smax_rel
+
+        if b <= 1 or a >= n_times - 2:
+            continue
+        a = max(a, 1)
+        b = min(b, n_times - 2)
+        if b <= a:
+            continue
+
+        x0 = a - 1
+        x1 = b + 1
+        if x0 < 0 or x1 >= n_times:
+            continue
+
+        y0 = data[:, x0]
+        y1 = data[:, x1]
+
+        n_seg = b - a + 1
+        w = np.linspace(0.0, 1.0, n_seg, dtype=float)
+        data[:, a:b+1] = (1.0 - w) * y0[:, None] + w * y1[:, None]
+
+    # escribir de vuelta SOLO esos canales
+    raw._data[picks, :] = data
+
+
+# 1) Cargar .set
+raw = mne.io.read_raw_eeglab(str(SET_PATH), preload=False, verbose="warning")
+
+print("\n=== Canales en el recording ===")
+print(raw.ch_names)
+
+# 2) Asegurar que existen EP y Biceps
+missing = [ch for ch in ENG_CHS if ch not in raw.ch_names]
+if missing:
+    raise RuntimeError(f"Faltan canales ENG en el archivo: {missing}")
+
+# 3) Eventos
+events, event_id = mne.events_from_annotations(raw)
+if len(events) == 0:
+    raise RuntimeError("No se encontraron eventos en annotations. Si tus triggers están en un canal STI, dímelo.")
+
+# 4) Quedarnos solo con ENG (para que todo el filtrado/epochs afecte solo a ENG)
+raw.pick(ENG_CHS)
+
+# picks ahora son 0..n-1 (porque ya hemos hecho pick)
+picks = [raw.ch_names.index(ch) for ch in ENG_CHS]
+
+# 5) Interpolar artefacto de estimulación [-1.5 ms, +4 ms]
+interpolate_artifact_window(raw, events, picks=picks, tmin=-0.0015, tmax=0.004)
+
+# 6) Downsample a 1000 Hz
+if abs(raw.info["sfreq"] - 1000.0) > 1e-6:
+    raw.resample(1000.0, npad="auto")
+
+# 7) Filtrado igual que ESG (según tu pipeline)
+# Notch 48–53 ~ 50Hz con width=5
+raw.notch_filter(freqs=[50], notch_widths=5, method="iir", verbose="error")
+
+# Band-pass 30–400, Butterworth 4º, zero-phase
+raw.filter(30, 400, method="iir",
+           iir_params=dict(order=4, ftype="butter"),
+           phase="zero", verbose="error")
+
+# 8) Epoching + baseline (mismas ventanas que ESG)
+epochs = mne.Epochs(
+    raw,
+    events,
+    event_id=event_id,
+    tmin=-0.2,
+    tmax=0.7,
+    baseline=(-0.11, -0.01),
+    reject_by_annotation=True,
+    preload=True,
+    verbose="warning",
+)
+
+print("\n=== Epochs ENG ===")
+print(epochs)
+
+# (Opcional) Guardar epochs
+# OUT_PATH = Path(r"C:\...\sub-001_eng_epo.fif")
+# epochs.save(str(OUT_PATH), overwrite=True)
